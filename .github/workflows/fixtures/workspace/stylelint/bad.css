@@ -1,0 +1,9 @@
+/* Custom Stylelint scenario: non-BEM class name forbidden by workspace config.
+ *
+ * Expected findings:
+ *   stylelint selector-class-pattern -- class "BadName" violates BEM naming
+ */
+
+.BadName {
+  color: blue;
+}
