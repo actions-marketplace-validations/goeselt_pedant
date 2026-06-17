@@ -111,7 +111,7 @@ jobs:
 
       - name: Commit Pin
         if: steps.intent.outputs.release-needed == 'true'
-        uses: goeselt/scribe@2dde3d76f0a8c6de2974c223b6dd562756fa872e # v1.1.0
+        uses: goeselt/scribe@b1f7a92ec86ef50d731050f59624a049854e031a # v1.1.1
         with:
           files: action.yml
           message: 'chore(pin): action.yml to v${{ steps.intent.outputs.next-version }}'
