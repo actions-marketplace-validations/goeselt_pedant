@@ -35,14 +35,14 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_KEY }}
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # intent release needs full history to find the previous release tag
           token: ${{ steps.app.outputs.token }}
 
       - id: intent
         name: Intent Release
-        uses: goeselt/intent@d168da88e1330163fb8943b119685d2af453fd8d # v1.0.2
+        uses: goeselt/intent@0ab5bbaa2e12d54e405da9e9664ac3328f2c274a # v1.2.3
         with:
           initial-version: '1.0.0'
 
@@ -59,11 +59,11 @@ jobs:
 
       - name: Set Up Docker Buildx
         if: steps.intent.outputs.release-needed == 'true'
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log In to GHCR
         if: steps.intent.outputs.release-needed == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -72,7 +72,7 @@ jobs:
       - name: Resolve Image Metadata
         id: meta
         if: steps.intent.outputs.release-needed == 'true'
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -84,7 +84,7 @@ jobs:
       - name: Build and Push
         id: build
         if: steps.intent.outputs.release-needed == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: true
@@ -96,7 +96,7 @@ jobs:
 
       - name: Attest Build Provenance
         if: steps.intent.outputs.release-needed == 'true'
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ghcr.io/goeselt/pedant
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -111,7 +111,7 @@ jobs:
 
       - name: Commit Pin
         if: steps.intent.outputs.release-needed == 'true'
-        uses: goeselt/scribe@2dde3d76f0a8c6de2974c223b6dd562756fa872e # v1.1.0
+        uses: goeselt/scribe@2d727b24c709116d2951b61d0091ed20bf777b72 # v1.2.3
         with:
           files: action.yml
           message: 'chore(pin): action.yml to v${{ steps.intent.outputs.next-version }}'
@@ -121,7 +121,7 @@ jobs:
 
       - name: Release
         if: steps.intent.outputs.release-needed == 'true'
-        uses: goeselt/dispatch@08a74b01bfe25e6b6201923e90e0b4b0e0425a67 # v1.0.5
+        uses: goeselt/dispatch@72482f5dee11ae6ad32d44b9d926c6d1708dea98 # v1.3.6
         with:
           release-tag: ${{ steps.intent.outputs.release-tag }}
           major-tag: ${{ steps.intent.outputs.major-tag }}
