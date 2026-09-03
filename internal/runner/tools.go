@@ -11,35 +11,60 @@ import (
 )
 
 // Registry lists all supported tools in execution order.
+// Fixers (CanFix: true) run before checkers (CanFix: false) so that check-only tools such as editorconfig see files in
+// their already-fixed state rather than the pre-fix state.
+//
+// Within fixers, opinionated formatters (prettier) run last so that their
+// check pass always sees files they just wrote.  Rule-based fixers (markdownlint,
+// eslint, stylelint) run first; prettier re-formats the result and has the
+// final say on whitespace and structure.
 var Registry = []ToolDef{
-	editorconfigTool,
+	// -- fixers: content transforms and rule-based linters first --
 	plainifyTool,
-	prettierTool,
 	shfmtTool,
+	taploTool,
 	ruffFormatTool,
-	golangciTool,
 	ruffTool,
 	textlintTool,
 	markdownlintTool,
 	eslintTool,
 	stylelintTool,
+	// -- fixers: opinionated formatters last --
+	prettierTool,
+	// -- checkers --
+	editorconfigTool,
+	golangciTool,
 	hadolintTool,
 	shellcheckTool,
 	yamllintTool,
 	actionlintTool,
 }
 
-// -- Helpers -----------------------------------------------------------------------------------------
+// -- Helpers ----------------------------------------------------------------------------------------------------------
 
-// workspaceConfig returns the path of the first candidate that exists in workspace,
-// or "" if none are found.
-func workspaceConfig(workspace string, candidates ...string) string {
+// workspaceConfigRel returns the workspace-relative path of the first candidate
+// that exists under workspace as a regular file (not a symlink), or "" if none
+// are found. Symlinks are rejected because they could point outside the workspace
+// and cause tools to read unintended files whose content might surface in output.
+func workspaceConfigRel(workspace string, candidates ...string) string {
 	for _, c := range candidates {
-		if _, err := os.Stat(filepath.Join(workspace, c)); err == nil {
-			return filepath.Join(workspace, c)
+		info, err := os.Lstat(filepath.Join(workspace, c))
+		if err != nil {
+			continue
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		return c
 	}
 	return ""
+}
+
+// makeConfigFinder returns a FindWorkspaceConfig function for the given candidates.
+func makeConfigFinder(candidates ...string) func(workspace string) string {
+	return func(workspace string) string {
+		return workspaceConfigRel(workspace, candidates...)
+	}
 }
 
 // bundledConfig returns path if it exists on the filesystem (inside the Docker image at /etc/pedant/),
@@ -64,16 +89,28 @@ func relativize(workspace, path string) string {
 	return filepath.ToSlash(rel)
 }
 
-// -- editorconfig (ec) -------------------------------------------------------------------------------
+func jsonOutput(stdout, stderr string) string {
+	if strings.TrimSpace(stdout) != "" {
+		return stdout
+	}
+	trimmed := strings.TrimSpace(stderr)
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		return stderr
+	}
+	return ""
+}
+
+// -- editorconfig (ec) ------------------------------------------------------------------------------------------------
 
 var editorconfigTool = ToolDef{
-	Name:   "editorconfig",
-	Binary: "ec",
-	CanFix: false,
-	Globs:  nil,
+	Name:                "editorconfig",
+	Binary:              "ec",
+	CanFix:              false,
+	Globs:               nil,
+	FindWorkspaceConfig: makeConfigFinder(".editorconfig-checker.json", ".ecrc"),
 	Args: func(_ bool, workspace string, files []string) []string {
-		args := []string{"-no-color"}
-		if workspaceConfig(workspace, ".editorconfig-checker.json", ".ecrc") == "" {
+		args := []string{"-no-color", "-format", "gcc"}
+		if workspaceConfigRel(workspace, ".editorconfig-checker.json", ".ecrc") == "" {
 			if cfg := bundledConfig("/etc/pedant/editorconfig/.editorconfig-checker.json"); cfg != "" {
 				args = append(args, "-config", cfg)
 			}
@@ -90,13 +127,24 @@ var editorconfigTool = ToolDef{
 var (
 	ecFileRE    = regexp.MustCompile(`^([^:]+):$`)
 	ecFindingRE = regexp.MustCompile(`^\s+(\d+):\s+(.+)$`)
+	ecGCCRE     = regexp.MustCompile(`^(.+):(\d+):(\d+):\s+([A-Za-z]+):\s+(.+)$`)
 )
 
 func parseEditorconfig(stdout, stderr string, _ int, _ string) ([]Finding, error) {
 	var findings []Finding
 	var currentFile string
 	for _, line := range strings.Split(stdout+stderr, "\n") {
-		if m := ecFileRE.FindStringSubmatch(line); m != nil {
+		if m := ecGCCRE.FindStringSubmatch(line); m != nil {
+			lineNum, _ := strconv.Atoi(m[2])
+			col, _ := strconv.Atoi(m[3])
+			findings = append(findings, Finding{
+				File:    m[1],
+				Line:    lineNum,
+				Col:     col,
+				Level:   strings.ToLower(m[4]),
+				Message: strings.TrimSpace(m[5]),
+			})
+		} else if m := ecFileRE.FindStringSubmatch(line); m != nil {
 			currentFile = m[1]
 		} else if m := ecFindingRE.FindStringSubmatch(line); m != nil && currentFile != "" {
 			lineNum, _ := strconv.Atoi(m[1])
@@ -110,7 +158,7 @@ func parseEditorconfig(stdout, stderr string, _ int, _ string) ([]Finding, error
 	return findings, nil
 }
 
-// -- prettier ----------------------------------------------------------------------------------------
+// -- prettier ---------------------------------------------------------------------------------------------------------
 
 var prettierConfigCandidates = []string{
 	".prettierrc", ".prettierrc.json", ".prettierrc.yml", ".prettierrc.yaml",
@@ -119,12 +167,13 @@ var prettierConfigCandidates = []string{
 }
 
 var prettierTool = ToolDef{
-	Name:   "prettier",
-	CanFix: true,
-	Globs:  []string{"*.json", "*.yml", "*.yaml", "*.md", "*.html", "*.css", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs"},
+	Name:                "prettier",
+	CanFix:              true,
+	Globs:               []string{"*.json", "*.yml", "*.yaml", "*.md", "*.html", "*.css", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs"},
+	FindWorkspaceConfig: makeConfigFinder(prettierConfigCandidates...),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{"--no-color"}
-		if workspaceConfig(workspace, prettierConfigCandidates...) == "" {
+		if workspaceConfigRel(workspace, prettierConfigCandidates...) == "" {
 			if cfg := bundledConfig("/etc/pedant/prettier/.prettierrc"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -159,7 +208,7 @@ func parsePrettier(stdout, stderr string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- shfmt -------------------------------------------------------------------------------------------
+// -- shfmt ------------------------------------------------------------------------------------------------------------
 
 var shfmtTool = ToolDef{
 	Name:   "shfmt",
@@ -185,15 +234,16 @@ func parseShfmt(stdout, _ string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- textlint ----------------------------------------------------------------------------------------
+// -- textlint ---------------------------------------------------------------------------------------------------------
 
 var textlintTool = ToolDef{
-	Name:   "textlint",
-	CanFix: true,
-	Globs:  []string{"*.md"},
+	Name:                "textlint",
+	CanFix:              true,
+	Globs:               []string{"*.md"},
+	FindWorkspaceConfig: makeConfigFinder(".textlintrc", ".textlintrc.json", ".textlintrc.yaml", ".textlintrc.yml"),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{}
-		if workspaceConfig(workspace, ".textlintrc", ".textlintrc.json", ".textlintrc.yaml", ".textlintrc.yml") == "" {
+		if workspaceConfigRel(workspace, ".textlintrc", ".textlintrc.json", ".textlintrc.yaml", ".textlintrc.yml") == "" {
 			if cfg := bundledConfig("/etc/pedant/textlint/.textlintrc.json"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -218,12 +268,13 @@ type textlintFileResult struct {
 	} `json:"messages"`
 }
 
-func parseTextlintJSON(stdout, _ string, _ int, workspace string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseTextlintJSON(stdout, stderr string, _ int, workspace string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var results []textlintFileResult
-	if err := json.Unmarshal([]byte(stdout), &results); err != nil {
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
 		return nil, fmt.Errorf("textlint JSON: %w", err)
 	}
 	var findings []Finding
@@ -241,16 +292,20 @@ func parseTextlintJSON(stdout, _ string, _ int, workspace string) ([]Finding, er
 	return findings, nil
 }
 
-// -- markdownlint ------------------------------------------------------------------------------------
+// -- markdownlint -----------------------------------------------------------------------------------------------------
 
 var markdownlintTool = ToolDef{
 	Name:   "markdownlint",
 	Binary: "markdownlint-cli2",
 	CanFix: true,
 	Globs:  []string{"*.md"},
+	FindWorkspaceConfig: makeConfigFinder(
+		".markdownlint-cli2.yaml", ".markdownlint-cli2.yml", ".markdownlint-cli2.jsonc",
+		".markdownlint.yaml", ".markdownlint.yml", ".markdownlint.json",
+	),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{}
-		if workspaceConfig(workspace,
+		if workspaceConfigRel(workspace,
 			".markdownlint-cli2.yaml", ".markdownlint-cli2.yml", ".markdownlint-cli2.jsonc",
 			".markdownlint.yaml", ".markdownlint.yml", ".markdownlint.json",
 		) == "" {
@@ -292,7 +347,7 @@ func parseMarkdownlint(stdout, stderr string, _ int, _ string) ([]Finding, error
 	return findings, nil
 }
 
-// -- eslint ------------------------------------------------------------------------------------------
+// -- eslint -----------------------------------------------------------------------------------------------------------
 
 var eslintConfigCandidates = []string{
 	"eslint.config.js", "eslint.config.mjs", "eslint.config.cjs",
@@ -301,12 +356,13 @@ var eslintConfigCandidates = []string{
 }
 
 var eslintTool = ToolDef{
-	Name:   "eslint",
-	CanFix: true,
-	Globs:  []string{"*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"},
+	Name:                "eslint",
+	CanFix:              true,
+	Globs:               []string{"*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts"},
+	FindWorkspaceConfig: makeConfigFinder(eslintConfigCandidates...),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{}
-		if workspaceConfig(workspace, eslintConfigCandidates...) == "" {
+		if workspaceConfigRel(workspace, eslintConfigCandidates...) == "" {
 			if cfg := bundledConfig("/etc/pedant/eslint/eslint.config.mjs"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -332,12 +388,13 @@ type eslintFileResult struct {
 	} `json:"messages"`
 }
 
-func parseEslint(stdout, _ string, _ int, workspace string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseEslint(stdout, stderr string, _ int, workspace string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var results []eslintFileResult
-	if err := json.Unmarshal([]byte(stdout), &results); err != nil {
+	if err := json.Unmarshal([]byte(output), &results); err != nil {
 		return nil, fmt.Errorf("eslint JSON: %w", err)
 	}
 	var findings []Finding
@@ -360,15 +417,16 @@ func parseEslint(stdout, _ string, _ int, workspace string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- hadolint ----------------------------------------------------------------------------------------
+// -- hadolint ---------------------------------------------------------------------------------------------------------
 
 var hadolintTool = ToolDef{
-	Name:   "hadolint",
-	CanFix: false,
-	Globs:  []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
+	Name:                "hadolint",
+	CanFix:              false,
+	Globs:               []string{"Dockerfile", "Dockerfile.*", "*.dockerfile"},
+	FindWorkspaceConfig: makeConfigFinder(".hadolint.yaml", ".hadolint.yml"),
 	Args: func(_ bool, workspace string, files []string) []string {
 		args := []string{"--format=json"}
-		cfgFile := workspaceConfig(workspace, ".hadolint.yaml", ".hadolint.yml")
+		cfgFile := workspaceConfigRel(workspace, ".hadolint.yaml", ".hadolint.yml")
 		if cfgFile == "" {
 			cfgFile = bundledConfig("/etc/pedant/hadolint/.hadolint.yaml")
 		}
@@ -396,11 +454,12 @@ func parseHadolint(stdout, stderr string, _ int, _ string) ([]Finding, error) {
 	if msg := strings.TrimSpace(stderr); strings.HasPrefix(msg, "Error parsing your config") {
 		return nil, fmt.Errorf("%s", msg)
 	}
-	if strings.TrimSpace(stdout) == "" {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var raw []hadolintFinding
-	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
 		return nil, fmt.Errorf("hadolint JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(raw))
@@ -417,15 +476,16 @@ func parseHadolint(stdout, stderr string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- shellcheck --------------------------------------------------------------------------------------
+// -- shellcheck -------------------------------------------------------------------------------------------------------
 
 var shellcheckTool = ToolDef{
-	Name:   "shellcheck",
-	CanFix: false,
-	Globs:  []string{"*.sh"},
+	Name:                "shellcheck",
+	CanFix:              false,
+	Globs:               []string{"*.sh"},
+	FindWorkspaceConfig: makeConfigFinder(".shellcheckrc"),
 	Args: func(_ bool, workspace string, files []string) []string {
 		args := []string{"--format=json"}
-		rcfile := workspaceConfig(workspace, ".shellcheckrc")
+		rcfile := workspaceConfigRel(workspace, ".shellcheckrc")
 		if rcfile == "" {
 			rcfile = bundledConfig("/etc/pedant/shellcheck/.shellcheckrc")
 		}
@@ -446,12 +506,13 @@ type shellcheckFinding struct {
 	Message string `json:"message"`
 }
 
-func parseShellcheck(stdout, _ string, _ int, _ string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseShellcheck(stdout, stderr string, _ int, _ string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var raw []shellcheckFinding
-	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
 		return nil, fmt.Errorf("shellcheck JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(raw))
@@ -468,15 +529,16 @@ func parseShellcheck(stdout, _ string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- yamllint ----------------------------------------------------------------------------------------
+// -- yamllint ---------------------------------------------------------------------------------------------------------
 
 var yamllintTool = ToolDef{
-	Name:   "yamllint",
-	CanFix: false,
-	Globs:  []string{"*.yml", "*.yaml"},
+	Name:                "yamllint",
+	CanFix:              false,
+	Globs:               []string{"*.yml", "*.yaml"},
+	FindWorkspaceConfig: makeConfigFinder(".yamllint.yml", ".yamllint.yaml", ".yamllint"),
 	Args: func(_ bool, workspace string, files []string) []string {
 		args := []string{"-f", "parsable"}
-		cfgFile := workspaceConfig(workspace, ".yamllint.yml", ".yamllint.yaml", ".yamllint")
+		cfgFile := workspaceConfigRel(workspace, ".yamllint.yml", ".yamllint.yaml", ".yamllint")
 		if cfgFile == "" {
 			cfgFile = bundledConfig("/etc/pedant/yamllint/.yamllint.yml")
 		}
@@ -521,17 +583,23 @@ func parseYamllint(stdout, stderr string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- actionlint --------------------------------------------------------------------------------------
+// -- actionlint -------------------------------------------------------------------------------------------------------
 
 var actionlintTool = ToolDef{
-	Name:   "actionlint",
-	CanFix: false,
-	Globs:  []string{".github/workflows/*.yml", ".github/workflows/*.yaml"},
+	Name:                "actionlint",
+	CanFix:              false,
+	Globs:               []string{".github/workflows/*.yml", ".github/workflows/*.yaml"},
+	FindWorkspaceConfig: makeConfigFinder(".github/actionlint.yaml", ".github/actionlint.yml", "actionlint.yaml", "actionlint.yml"),
 	Args: func(_ bool, workspace string, files []string) []string {
 		args := []string{"-no-color", "-format", "{{json .}}"}
-		cfgFile := workspaceConfig(workspace, ".github/actionlint.yaml", ".github/actionlint.yml", "actionlint.yaml", "actionlint.yml")
-		if cfgFile == "" {
+		cfgFile := workspaceConfigRel(workspace, ".github/actionlint.yaml", ".github/actionlint.yml", "actionlint.yaml", "actionlint.yml")
+		usingBundled := cfgFile == ""
+		if usingBundled {
 			cfgFile = bundledConfig("/etc/pedant/actionlint/actionlint.yaml")
+			// The actionlint YAML config `ignore:` field has no effect on runner-label errors;
+			// only the -ignore CLI flag suppresses them.
+			// Apply it here when using the bundled config so custom self-hosted runner labels are not flagged.
+			args = append(args, "-ignore", `label ".+" is unknown`)
 		}
 		if cfgFile != "" {
 			args = append(args, "-config-file", cfgFile)
@@ -549,12 +617,13 @@ type actionlintFinding struct {
 	Kind     string `json:"kind"`
 }
 
-func parseActionlint(stdout, _ string, _ int, _ string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseActionlint(stdout, stderr string, _ int, _ string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var raw []actionlintFinding
-	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
 		return nil, fmt.Errorf("actionlint JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(raw))
@@ -570,7 +639,7 @@ func parseActionlint(stdout, _ string, _ int, _ string) ([]Finding, error) {
 	return findings, nil
 }
 
-// -- golangci-lint -----------------------------------------------------------------------------------
+// -- golangci-lint ----------------------------------------------------------------------------------------------------
 
 var golangciTool = ToolDef{
 	Name:   "golangci-lint",
@@ -582,12 +651,13 @@ var golangciTool = ToolDef{
 		_, err := os.Stat(filepath.Join(workspace, "go.mod"))
 		return err != nil
 	},
-	Reason:  "no go.mod at workspace root",
-	NoBatch: true, // ignores the file list; always runs ./...
+	Reason:              "no go.mod at workspace root",
+	NoBatch:             true, // ignores the file list; always runs ./...
+	FindWorkspaceConfig: makeConfigFinder(".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json"),
 	Args: func(_ bool, workspace string, _ []string) []string {
 		// golangci-lint operates on packages, not individual files.
 		args := []string{"run", "--output.json.path=stdout"}
-		cfgFile := workspaceConfig(workspace, ".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json")
+		cfgFile := workspaceConfigRel(workspace, ".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json")
 		if cfgFile == "" {
 			if cfg := bundledConfig("/etc/pedant/golangci-lint/.golangci.yml"); cfg != "" {
 				args = append(args, "--config", cfg)
@@ -610,14 +680,15 @@ type golangciOutput struct {
 	} `json:"Issues"`
 }
 
-func parseGolangciLint(stdout, _ string, _ int, workspace string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseGolangciLint(stdout, stderr string, _ int, workspace string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	// Use Decoder instead of Unmarshal: golangci-lint appends a plain-text
 	// summary after the JSON object, which would cause Unmarshal to fail.
 	var out golangciOutput
-	if err := json.NewDecoder(strings.NewReader(stdout)).Decode(&out); err != nil {
+	if err := json.NewDecoder(strings.NewReader(output)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("golangci-lint JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(out.Issues))
@@ -643,7 +714,7 @@ func resolveGolangciPath(workspace, path string) string {
 	return relativize(workspace, path)
 }
 
-// -- plainify ----------------------------------------------------------------------------------------
+// -- plainify ---------------------------------------------------------------------------------------------------------
 
 var plainifyTool = ToolDef{
 	Name:   "plainify",
@@ -670,13 +741,18 @@ type plainifyOutput struct {
 
 func parsePlainify(stdout, stderr string, exitCode int, _ string) ([]Finding, error) {
 	if exitCode == 2 {
-		return nil, fmt.Errorf("%s", strings.TrimSpace(stderr))
+		msg := strings.TrimSpace(stderr)
+		if msg == "" {
+			msg = strings.TrimSpace(stdout)
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
-	if strings.TrimSpace(stdout) == "" {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var out plainifyOutput
-	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+	if err := json.Unmarshal([]byte(output), &out); err != nil {
 		return nil, fmt.Errorf("plainify JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(out.Findings))
@@ -691,20 +767,21 @@ func parsePlainify(stdout, stderr string, exitCode int, _ string) ([]Finding, er
 	return findings, nil
 }
 
-// -- ruff-format -------------------------------------------------------------------------------------
+// -- ruff-format ------------------------------------------------------------------------------------------------------
 
 var ruffConfigCandidates = []string{
 	"ruff.toml", ".ruff.toml", "pyproject.toml",
 }
 
 var ruffFormatTool = ToolDef{
-	Name:   "ruff-format",
-	Binary: "ruff",
-	CanFix: true,
-	Globs:  []string{"*.py"},
+	Name:                "ruff-format",
+	Binary:              "ruff",
+	CanFix:              true,
+	Globs:               []string{"*.py"},
+	FindWorkspaceConfig: makeConfigFinder(ruffConfigCandidates...),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{"format", "--no-cache"}
-		if workspaceConfig(workspace, ruffConfigCandidates...) == "" {
+		if workspaceConfigRel(workspace, ruffConfigCandidates...) == "" {
 			if cfg := bundledConfig("/etc/pedant/ruff/ruff.toml"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -731,7 +808,7 @@ func parseRuffFormat(stdout, stderr string, _ int, _ string) ([]Finding, error) 
 	return findings, nil
 }
 
-// -- stylelint ---------------------------------------------------------------------------------------
+// -- stylelint --------------------------------------------------------------------------------------------------------
 
 var stylelintConfigCandidates = []string{
 	".stylelintrc",
@@ -747,12 +824,13 @@ var stylelintConfigCandidates = []string{
 }
 
 var stylelintTool = ToolDef{
-	Name:   "stylelint",
-	CanFix: true,
-	Globs:  []string{"*.css"},
+	Name:                "stylelint",
+	CanFix:              true,
+	Globs:               []string{"*.css"},
+	FindWorkspaceConfig: makeConfigFinder(stylelintConfigCandidates...),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{}
-		if workspaceConfig(workspace, stylelintConfigCandidates...) == "" {
+		if workspaceConfigRel(workspace, stylelintConfigCandidates...) == "" {
 			if cfg := bundledConfig("/etc/pedant/stylelint/.stylelintrc.json"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -780,11 +858,8 @@ type stylelintFileResult struct {
 
 func parseStylelint(stdout, stderr string, _ int, workspace string) ([]Finding, error) {
 	// stylelint v16+ writes --formatter json to stderr instead of stdout.
-	output := stdout
-	if strings.TrimSpace(output) == "" {
-		output = stderr
-	}
-	if strings.TrimSpace(output) == "" {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var results []stylelintFileResult
@@ -811,16 +886,17 @@ func parseStylelint(stdout, stderr string, _ int, workspace string) ([]Finding, 
 	return findings, nil
 }
 
-// -- ruff (check) ------------------------------------------------------------------------------------
+// -- ruff (check) -----------------------------------------------------------------------------------------------------
 
 var ruffTool = ToolDef{
-	Name:   "ruff",
-	Binary: "ruff",
-	CanFix: true,
-	Globs:  []string{"*.py"},
+	Name:                "ruff",
+	Binary:              "ruff",
+	CanFix:              true,
+	Globs:               []string{"*.py"},
+	FindWorkspaceConfig: makeConfigFinder(ruffConfigCandidates...),
 	Args: func(fix bool, workspace string, files []string) []string {
 		args := []string{"check", "--no-cache"}
-		if workspaceConfig(workspace, ruffConfigCandidates...) == "" {
+		if workspaceConfigRel(workspace, ruffConfigCandidates...) == "" {
 			if cfg := bundledConfig("/etc/pedant/ruff/ruff.toml"); cfg != "" {
 				args = append(args, "--config", cfg)
 			}
@@ -845,12 +921,13 @@ type ruffFinding struct {
 	} `json:"location"`
 }
 
-func parseRuff(stdout, _ string, _ int, workspace string) ([]Finding, error) {
-	if strings.TrimSpace(stdout) == "" {
+func parseRuff(stdout, stderr string, _ int, workspace string) ([]Finding, error) {
+	output := jsonOutput(stdout, stderr)
+	if output == "" {
 		return nil, nil
 	}
 	var raw []ruffFinding
-	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
 		return nil, fmt.Errorf("ruff JSON: %w", err)
 	}
 	findings := make([]Finding, 0, len(raw))
@@ -861,6 +938,49 @@ func parseRuff(stdout, _ string, _ int, workspace string) ([]Finding, error) {
 			Col:     r.Location.Column,
 			Rule:    r.Code,
 			Message: r.Message,
+		})
+	}
+	return findings, nil
+}
+
+// -- taplo ------------------------------------------------------------------------------------------------------------
+
+var taploTool = ToolDef{
+	Name:                "taplo",
+	CanFix:              true,
+	Globs:               []string{"*.toml"},
+	FindWorkspaceConfig: makeConfigFinder(".taplo.toml", "taplo.toml"),
+	Args: func(fix bool, workspace string, files []string) []string {
+		args := []string{"format"}
+		if workspaceConfigRel(workspace, ".taplo.toml", "taplo.toml") == "" {
+			if cfg := bundledConfig("/etc/pedant/taplo/taplo.toml"); cfg != "" {
+				args = append(args, "--config", cfg)
+			}
+		}
+		if !fix {
+			args = append(args, "--check")
+		}
+		return append(args, files...)
+	},
+	Parse: parseTaplo,
+}
+
+// taplo format --check stderr: "... the file is not properly formatted path="/abs/path/to/file.toml""
+var taploRe = regexp.MustCompile(`not properly formatted path="([^"]+)"`)
+
+func parseTaplo(stdout, stderr string, exitCode int, workspace string) ([]Finding, error) {
+	if exitCode == 0 {
+		return nil, nil
+	}
+	var findings []Finding
+	for _, line := range strings.Split(stderr+stdout, "\n") {
+		m := taploRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		findings = append(findings, Finding{
+			File:    relativize(workspace, m[1]),
+			Message: "needs formatting",
 		})
 	}
 	return findings, nil

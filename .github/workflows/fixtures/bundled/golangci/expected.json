@@ -1,5 +1,22 @@
 {
+  "files_discovered": 2,
   "status": "fail",
-  "tools_errored": [],
-  "tools_failing": ["golangci-lint"]
+  "tools": [
+    {
+      "files": [
+        "main.go"
+      ],
+      "finding_count": 7,
+      "has_error": false,
+      "name": "golangci-lint",
+      "rules": [
+        "dupword",
+        "errcheck",
+        "nilerr",
+        "noctx"
+      ],
+      "status": "fail"
+    }
+  ],
+  "total_findings": 7
 }
